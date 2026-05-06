@@ -1,224 +1,318 @@
-# Network traffic classification — project journey (USTC-TFC2016 → histograms → SVM → W&B)
+# Use Case 1 — Network Traffic Classification (NTC) walkthrough
 
-This note wraps the work end-to-end: what we set out to do, the commands we actually ran, what broke and how we fixed it, and how the numbers show the pipeline is doing something meaningful—especially for **benign vs malware** separation.
+As an introduction to **network traffic classification (NTC)**, I worked through a small end-to-end project based on a public GitHub repository. The upstream repo (course-style mini project) is here:
 
----
+**Upstream repository:** [https://github.com/shivmohith/Network-Traffic-Classification](https://github.com/shivmohith/Network-Traffic-Classification/tree/master)
 
-## 1. Where we started
+**My fork (Linux paths, fixed `requirements.txt`, histogram + SVM updates, this journey doc):** [https://github.com/kimeeadnan/Network-Traffic-Classification](https://github.com/kimeeadnan/Network-Traffic-Classification)
 
-**Goal:** Reproduce a PCAP → image → feature → classifier workflow on **USTC-TFC2016**, using the USTC preprocessing toolkit and the course repo **Network-Traffic-Classification**, with **Weights & Biases** to track runs.
+This project is deliberately **simple and straightforward**: it is framed around **network anomaly / intrusion-style thinking**—traffic is observed and the model tries to tell **benign (normal)** traffic from **malware** traffic. The method is classic ML: turn captures into **images**, extract **histogram features**, then train a **Support Vector Machine (SVM)**. You get both **binary** (benign vs malware) and **multiclass** (which of the 10+10 families) experiments.
 
-**Main locations:**
+In this document I explain things **as simply and as thoroughly as I can**, for my own understanding and for anyone else walking the same path. It includes:
 
-| Piece | Path |
-|--------|------|
-| Raw / extracted PCAPs (your copy) | `/home/user/intern-kimu/ntc/uc1/data/USTC-TFC2016/` |
-| USTC toolkit (ubuntu branch) | `/home/user/intern-kimu/ntc/uc1/USTC-TK2016/` |
-| This course repo + venv | `/home/user/intern-kimu/ntc/uc1/Network-Traffic-Classification/` (venv: **`.ven/`**) |
+- **Description** — what the problem is and what the repo does  
+- **Dataset** — USTC-TFC2016, classes, L7 vs all layers  
+- **Process** — clone, environment, data, PCAP → image → features → SVM, and what broke along the way  
+- **Result** — numbers from my runs, compared to the original README claims  
+- **Reference** — papers and repos  
 
----
-
-## 2. High-level pipeline
-
-```mermaid
-flowchart LR
-  PCAP[PCAP files] --> S1[1_Pcap2Session]
-  S1 --> S2[2_ProcessSession]
-  S2 --> PNG[3_Session2Png]
-  PNG --> IMG[Greyscale PNGs in 4_Png/Train]
-  IMG --> HIST[Histogram 32 bins + label]
-  HIST --> CSV[CSV datasets]
-  CSV --> SVM[SVM train / test]
-  SVM --> WB[W&B metrics]
-```
-
-- **L7** vs **AllLayers** is chosen in the USTC session step (PowerShell flags) and must match the PNGs you feed into the Python histogram scripts (`NTC_LAYER`).
+I hope this note helps **me and others** build intuition for NTC, not just “run a script once.”
 
 ---
 
-## 3. Environment setup
+## Description (from the repo)
 
-From the **Network-Traffic-Classification** directory:
+**Traffic classification** is an early step for **network anomaly detection** and **network-based intrusion detection**. It matters because traffic on a real network is a mix of **normal (benign)** flows and **malware-related** flows. Malicious or unwanted traffic can waste bandwidth, contribute to DoS-style effects, or harm receivers; separating **normal** from **malware** (and ideally naming the family) supports security monitoring and response.
+
+This particular project does **not** classify raw packets directly in the ML step. Instead it:
+
+1. Starts from **packet captures** (e.g. from **Wireshark** / `.pcap`).  
+2. Converts them into **grayscale images** (pixel values 0–255) using the USTC-style preprocessing pipeline.  
+3. Treats each image as a signal and computes a **histogram** over pixel intensities—the histogram bins are the **feature vector**.  
+4. Trains an **SVM** on those features.
+
+There are **two classification tasks**:
+
+| Task | What it predicts |
+|------|------------------|
+| **Binary classification** | Benign **or** malware (two labels). |
+| **Multiclass classification** | **Which** application/malware family (many labels; in our setup, **24** indexed classes matching the toolkit layout). |
+
+The original README also describes two **data variants**: traffic represented using only the **application layer (L7)** vs **all OSI layers**. You should treat those as **separate experiments**: you regenerate images with the toolkit for one mode, build a dataset, train, then repeat for the other.
+
+---
+
+## Dataset (from the repo)
+
+The standard dataset name is **USTC-TFC2016**. It contains both **benign** and **malware** traffic. The README summarizes **10 benign** and **10 malware** families (naming); the **preprocessing toolkit** ends up with a **24-folder** class index layout under `4_Png/Train/0` … `23` (order defined by the tool—not always identical to a simple alphabetical table, so always use the **same** toolkit run for labels and images).
+
+| **Benign classes** | **Malware classes** |
+| --- | --- |
+| BitTorrent | Cridex |
+| Facetime | Geodo |
+| FTP | Htbot |
+| GMail | Miuref |
+| MySQL | Neris |
+| Outlook | Nsis-ay |
+| Skype | Shifu |
+| SMB | Tinba |
+| Weibo | Virut |
+| World of Craft | Zeus |
+
+**Two representations (important):**
+
+- **L7 only** — features derived from traffic that emphasizes the **application layer**.  
+- **All layers** — features derived from traffic that includes **more of the stack**, not only L7.
+
+The same classification code can run on both, but the **PNGs must be regenerated** with the matching mode in the USTC scripts. If you mix “AllLayers PNGs” with code that assumes L7 (or the opposite), your results will not mean what you think.
+
+**Where to get the data**
+
+The **Network-Traffic-Classification** repo **does not ship the PCAPs**; the README only names the dataset. You obtain captures yourself, for example from:
+
+- **USTC-TFC2016 (hosting / layout):** [https://github.com/davidyslu/USTC-TFC2016](https://github.com/davidyslu/USTC-TFC2016)  
+
+Clone or download into a folder you control (example layout I used: a `data/USTC-TFC2016/` tree with benign/malware PCAPs). You still need the **USTC-TK2016** preprocessing tools (next section) to turn PCAPs into **sessions** and then **PNG** images.
+
+---
+
+## Process
+
+### 1. Clone the classification project
+
+Use the **repository root** URL. GitHub web links that end in `/tree/master` or `/blob/...` are **for browsing in the browser**, not for `git clone`.
+
+**Correct:**
 
 ```bash
-cd /home/user/intern-kimu/ntc/uc1/Network-Traffic-Classification
-python3 -m venv .ven
-source .ven/bin/activate
+git clone https://github.com/shivmohith/Network-Traffic-Classification.git
+cd Network-Traffic-Classification
+```
+
+**Incorrect (will fail):**
+
+```bash
+# Do NOT paste a /blob/master or /tree/master link as if it were a repo URL
+git clone https://github.com/shivmohith/Network-Traffic-Classification/blob/master.git
+```
+
+The same rule applies when cloning **DeepTraffic** or any other repo: always clone the **`.git` URL of the repo root**, e.g. `https://github.com/echowei/DeepTraffic.git`.
+
+---
+
+### 2. Python virtual environment and dependencies
+
+A virtual environment keeps packages for this project separate from your system Python.
+
+```bash
+cd /path/to/Network-Traffic-Classification
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 python -m pip install -U pip
 python -m pip install -r requirements.txt
 ```
 
-**PowerShell on Linux** (for the USTC `.ps1` scripts) was installed so we could run the official toolkit steps (e.g. on Debian: Microsoft’s `packages-microsoft-prod` repo, then `apt install powershell`, command `pwsh`).
+> **Tip — `pip` flags people mix up**  
+> - **`-U` (upgrade):** reinstalls the listed package so you get a **current** version within your constraints, e.g. `pip install -U pip` upgrades the **pip** tool itself.  
+> **`-r`:** read a **requirements file** and install every line, e.g. `pip install -r requirements.txt`.
+
+On my machine I happened to name the folder `.ven` instead of `.venv`; the idea is the same—**one venv per project**, activate before running scripts.
 
 ---
 
-## 4. USTC toolkit: PCAP → sessions → PNGs
+### 3. Fixing `requirements.txt` (old repo reality)
 
-Run from **`USTC-TK2016`** (paths illustrative—use the same flags you used for L7 vs AllLayers):
+The upstream project is from **2019**. PyPI package names and ecosystems have moved on. Typical fixes:
 
-**L7-style run (example from the journey):**
+| Wrong or fragile | Use instead | Why |
+| --- | --- | --- |
+| `skimage` as the install name | **`scikit-image`** | The import is `skimage`, but the **package** to install is `scikit-image`. A bare `skimage` on PyPI is not what you want. |
+| `PIL` in requirements | **`Pillow`** | You `import PIL`, but the installable distribution is **Pillow**. |
+| Missing SVM dependency | **`scikit-learn`** | Provides `sklearn`; the code uses it for `SVC`, metrics, splits, etc. |
+| Optional experiment tracking | **`wandb`** | If you want logged metrics and run comparison (optional). |
+
+A **minimal sane** requirements set for the fork I used looks like:
+
+```text
+opencv-python
+numpy
+tqdm
+pandas
+scikit-image
+scikit-learn
+wandb
+```
+
+After editing, reinstall:
 
 ```bash
-cd /home/user/intern-kimu/ntc/uc1/USTC-TK2016
+python -m pip install -r requirements.txt
+```
+
+---
+
+### 4. Data collection and preprocessing (PCAP → PNG)
+
+**4.1 Obtain PCAPs** (see [Dataset](#dataset-from-the-repo)): place them where the USTC toolkit expects them (follow the **USTC-TK2016** README / script layout—often `1_Pcap/`).
+
+**4.2 Use the official preprocessing toolkit** from the DeepTraffic / USTC tooling (ubuntu-oriented branch in practice). Reference from the original README:
+
+- [DeepTraffic — PreprocessedTools (USTC-TK2016)](https://github.com/echowei/DeepTraffic/tree/master/1.malware_traffic_classification/2.PreprocessedTools(USTC-TK2016))
+
+On **Linux**, the `.ps1` scripts are run with **PowerShell** (`pwsh`) after installing PowerShell for your distro.
+
+Example flow (from the **`USTC-TK2016`** directory; flags must match **L7 vs AllLayers**):
+
+```bash
+cd /path/to/USTC-TK2016
 pwsh ./1_Pcap2Session.ps1 -s
-pwsh ./2_ProcessSession.ps1 -l -u
+pwsh ./2_ProcessSession.ps1 -l -u    # example: L7-oriented run; see toolkit docs for -a (all layers)
 python3 3_Session2Png.py
 ```
 
-**AllLayers** (example): regenerate sessions/PNGs with the toolkit flags you used for **`-a -u`** (all layers + ubuntu layout), then run `3_Session2Png.py` again so **`4_Png`** matches **`TrimedSession/Train`**.
+For **all layers**, use the toolkit’s **all-layers** options (e.g. `-a` where applicable), then **re-run** `3_Session2Png.py` so **`4_Png`** matches.
 
-The PNGs land under `USTC-TK2016/4_Png/Train/{0..23}/` (24 classes, indices aligned with folder order from the toolkit).
+You should end up with greyscale PNGs under something like:
+
+`USTC-TK2016/4_Png/Train/<class_index>/*.png`
+
+**4.3 Point the course repo at those PNGs**
+
+The original Windows code used hardcoded paths like `D:\...`. A practical layout is:
+
+- Put / symlink **`USTC-TK2016`** next to **`Network-Traffic-Classification`**, or  
+- Set environment variables the scripts understand (in our fork: `NTC_TRAIN_DIR`, `NTC_LAYER`, `NTC_OUTPUT_CSV`, `NTC_DATASET_CSV`, etc.).
 
 ---
 
-## 5. Course repo: build CSVs and train SVMs
+### 5. Feature extraction (histogram) and labels
 
-Always activate the venv first:
+Histogram scripts live under **`Pre-processing/`**. They read PNGs, compute **32-bin** histograms (per image), flatten to a row, and append **`label`**.
 
-```bash
-cd /home/user/intern-kimu/ntc/uc1/Network-Traffic-Classification
-source .ven/bin/activate
-```
+- **Multiclass:** e.g. `hist_L7_all_classes.py` → CSV with 32 features + integer class.  
+- **Binary:** e.g. `hist_binary_from_png.py` → same features + **benign=1 / malware=0** (mapping derived from class index and the benign/malware split).
 
-### 5.1 Multiclass (24 app / malware family labels), 32-bin histogram
-
-**L7 (default paths):**
+Activate the venv, then examples:
 
 ```bash
+cd /path/to/Network-Traffic-Classification
+source .venv/bin/activate
+
+# Multiclass, L7 (default layout)
 python3 Pre-processing/hist_L7_all_classes.py
 python3 Classification/svm_multi.py
-```
 
-**AllLayers (override train dir + output + W&B run name):**
-
-```bash
-export NTC_LAYER=AllLayers   # must match PNG layout under USTC 4_Png
-NTC_OUTPUT_CSV=dataset_all_layers_multiclass_bin32.csv \
+# Multiclass, AllLayers (env overrides)
+NTC_LAYER=AllLayers \
+  NTC_OUTPUT_CSV=dataset_all_layers_multiclass_bin32.csv \
   python3 Pre-processing/hist_L7_all_classes.py
 
 NTC_LAYER=AllLayers \
-NTC_DATASET_CSV=dataset_all_layers_multiclass_bin32.csv \
-NTC_WANDB_TRAIN_NAME=svm_multiclass_all_layers_bin32 \
+  NTC_DATASET_CSV=dataset_all_layers_multiclass_bin32.csv \
+  NTC_WANDB_TRAIN_NAME=svm_multiclass_all_layers_bin32 \
   python3 Classification/svm_multi.py
-```
 
-### 5.2 Binary (benign = 1, malware = 0), 32-bin histogram
-
-**L7:**
-
-```bash
+# Binary, L7
 python3 Pre-processing/hist_binary_from_png.py
 python3 Classification/svm_binary.py
-```
 
-**AllLayers:**
-
-```bash
+# Binary, AllLayers
 NTC_LAYER=AllLayers \
-NTC_OUTPUT_CSV=dataset_all_layers_binary_bin32.csv \
+  NTC_OUTPUT_CSV=dataset_all_layers_binary_bin32.csv \
   python3 Pre-processing/hist_binary_from_png.py
 
 NTC_LAYER=AllLayers \
-NTC_DATASET_CSV=dataset_all_layers_binary_bin32.csv \
-NTC_WANDB_TRAIN_NAME=svm_binary_all_layers_bin32 \
+  NTC_DATASET_CSV=dataset_all_layers_binary_bin32.csv \
+  NTC_WANDB_TRAIN_NAME=svm_binary_all_layers_bin32 \
   python3 Classification/svm_binary.py
 ```
 
-### 5.3 Artifacts produced
+Generated CSV names we used (examples):
 
-| File | Role |
-|------|------|
-| `dataset_L7_multiclass_bin32.csv` | L7, 24-class labels |
-| `dataset_all_layers_multiclass_bin32.csv` | AllLayers, 24-class |
-| `dataset_L7_binary_bin32.csv` | L7, benign vs malware |
-| `dataset_all_layers_binary_bin32.csv` | AllLayers, benign vs malware |
+| CSV | Meaning |
+| --- | --- |
+| `dataset_L7_multiclass_bin32.csv` | L7 PNGs, 24-way labels |
+| `dataset_all_layers_multiclass_bin32.csv` | All-layers PNGs, 24-way |
+| `dataset_L7_binary_bin32.csv` | L7 PNGs, benign vs malware |
+| `dataset_all_layers_binary_bin32.csv` | All-layers PNGs, binary |
 
-Each CSV: **32** histogram features + **`label`**.
-
----
-
-## 6. Problems we hit (and fixes)
-
-| Problem | What happened | Fix |
-|--------|----------------|-----|
-| **`pip install skimage`** | PyPI package `skimage` is not the real library | Use **`scikit-image`** in `requirements.txt` |
-| **`PIL` in requirements** | Not a valid PyPI name as used | Use **`Pillow`** |
-| **Wrong `git clone` URL** | Cloning a GitHub **`/tree/...`** link fails | Clone repo root, e.g. `https://github.com/echowei/DeepTraffic.git` |
-| **`hist_L7_all_classes.py`** | Hardcoded Windows path `D:\ML mini project\...` | Rewrote script to read **`USTC-TK2016/4_Png/Train`** and optional env overrides (`NTC_TRAIN_DIR`, `NTC_OUTPUT_CSV`, `NTC_LAYER`) |
-| **`ModuleNotFoundError: sklearn`** | `scikit-learn` not installed in `.ven` | Added to **`requirements.txt`** and `pip install` into `.ven` |
-| **pandas 2.x** | `df.drop('label', axis=1)` patterns | Use `df.drop(columns=['label'])` in `svm_multi.py` |
-| **L7 vs AllLayers mismatch** | Stale PNGs vs new session mode | Re-run USTC steps and **`3_Session2Png.py`** so **`4_Png`** matches the chosen layer mode |
+> **Git note:** Large CSVs are often **gitignored** so the repo stays small; regenerate them locally with the commands above.
 
 ---
 
-## 7. Results (from your runs — May 6, 2026)
+### 6. Problems I actually hit (so you can skip the detours)
 
-**Shared test setup (binary):** ~**11,983** test samples; train ~**107,838** (stratified split in `svm_binary.py`).
-
-**Multiclass:** ~**95,856** train / **23,965** test; **24** classes; **32** features; bin size **32**.
-
-### 7.1 Accuracy comparison
-
-| Task | Layer mode | Test accuracy | W&B run name (example) |
-|------|------------|---------------|-------------------------|
-| **Binary** | L7 | **95.65%** (0.9565) | `svm_binary_l7_bin32` |
-| **Binary** | AllLayers | **95.31%** (0.9531) | `svm_binary_all_layers_bin32` |
-| **Multiclass (24 classes)** | L7 | **79.60%** (0.7960) | `svm_multiclass_l7_bin32` |
-| **Multiclass (24 classes)** | AllLayers | **79.34%** (0.7934) | `svm_multiclass_all_layers_bin32` |
-
-**Takeaway:** For this feature set (32-bin histograms + linear SVM), **L7 vs AllLayers** barely changes multiclass accuracy, and **binary** stays in the **~95%** band for both—strong separation between benign and malware at the image-statistics level.
-
-**W&B project (all runs):** [https://wandb.ai/ahmadhakimiadnan-other/network-traffic-classification](https://wandb.ai/ahmadhakimiadnan-other/network-traffic-classification)
-
-### 7.2 Why binary “classifies well” (evidence from sklearn reports)
-
-**L7 binary** (malware = 0, benign = 1):
-
-| Class | Precision | Recall | F1-score | Support (test) |
-|-------|-----------|--------|----------|----------------|
-| 0 (malware) | **0.99** | **0.93** | **0.96** | 6312 |
-| 1 (benign) | **0.92** | **0.99** | **0.96** | 5671 |
-| **Overall accuracy** | | | **0.96** | **11983** |
-
-**AllLayers binary:**
-
-| Class | Precision | Recall | F1-score | Support (test) |
-|-------|-----------|--------|----------|----------------|
-| 0 (malware) | **0.99** | **0.92** | **0.95** | 6312 |
-| 1 (benign) | **0.92** | **0.99** | **0.95** | 5671 |
-| **Overall accuracy** | | | **0.95** | **11983** |
-
-Interpretation in plain language:
-
-- **High precision on malware (0)** means when the model says “malware,” it is usually right.
-- **High recall on benign (1)** means most benign sessions are caught and not mislabeled as malware.
-- F1 near **0.95–0.96** on both sides shows the tradeoff stays balanced—not a model that only predicts the majority class.
-
-Dataset balance for binary (full CSV before split), from your log: **malware 63,119** vs **benign 56,702** — slightly more malware rows; the **~95%** accuracy is not from trivial majority guessing alone.
-
-### 7.3 Multiclass honesty check
-
-24-way classification is harder; overall accuracy is **~79–80%**. The **AllLayers** run’s per-class report showed a few labels with **0.00** precision/recall (very small test support or no predicted samples), which triggers sklearn’s `UndefinedMetricWarning`. That is expected for hard multi-class with **only 32 histogram features**—it does **not** contradict the strong binary results; it means some rare or similar-looking families are conflated.
+1. **`FileNotFoundError` for `D:\...`** — the upstream script assumed Windows. **Fix:** paths relative to `USTC-TK2016/4_Png` + env overrides.  
+2. **`ModuleNotFoundError: sklearn`** — **Fix:** `pip install scikit-learn` and add it to `requirements.txt`.  
+3. **`skimage` install confusion** — **Fix:** install **`scikit-image`**, import `skimage` in code.  
+4. **Broken `git clone` URLs** — copying `/tree/...` or `/blob/...` links. **Fix:** clone the **repo root** `.git` URL only.  
+5. **L7 vs AllLayers mismatch** — training on features from one mode while thinking it was the other. **Fix:** one full toolchain pass per mode; matching `NTC_LAYER` when building CSVs.  
+6. **pandas 2.x** — some `drop` patterns needed updating to `df.drop(columns=['label'])`.  
+7. **Multiclass metrics warnings** — sklearn may warn when a class has **no predictions** or tiny support; read per-class precision/recall, not only accuracy.
 
 ---
 
-## 8. What we learned (story arc)
+### 7. High-level pipeline (visual)
 
-1. **Reality of “course repo on GitHub”:** paths and dependencies were frozen to an old Windows layout; we **ported paths to Linux** and **pinned correct PyPI names**.
-2. **The USTC toolchain is the source of truth** for PCAP → PNG; Python scripts must point at **`4_Png`** that came from the **same** L7/AllLayers choice.
-3. **Binary vs multiclass:** same features give **much** easier **benign/malware** separation than **24-way** family ID—as the metrics show.
-4. **Experiment tracking:** W&B gave comparable runs (`l7_histogram_build`, `alllayers_histogram_build`, `svm_*`) so the journey is reproducible from commands + env vars.
-
----
-
-## 9. Quick “done” checklist
-
-- [x] Venv + `requirements.txt` (opencv, numpy, pandas, scikit-image, scikit-learn, wandb, …)
-- [x] USTC: PCAP → session → PNG
-- [x] Multiclass + binary CSVs for **L7** and **AllLayers**
-- [x] SVM training with logged metrics on **W&B**
-- [x] Binary **~95%** test accuracy with balanced per-class metrics
+```mermaid
+flowchart LR
+  PCAP[PCAP captures] --> A[USTC: Pcap → Session]
+  A --> B[USTC: Session → PNG]
+  B --> PNG[Greyscale images]
+  PNG --> H[Histogram 32 bins]
+  H --> CSV[Feature CSV + label]
+  CSV --> SVM[SVM train / test]
+  SVM --> WB[Optional: Weights & Biases]
+```
 
 ---
 
-*Document generated to close out the internship / coursework thread: one place for commands, failures, fixes, and proof the classifier works where it matters most (binary detection).*
+## Result
+
+### What the original README claimed
+
+The upstream README states very high accuracy (**100%** binary, **98%** multiclass). Those numbers depend on **exact data split, features, and environment** from the author’s 2019 run. When you **reproduce on modern Python, Linux paths, and the same public dataset**, you should expect **similar trends** but **not necessarily identical percentages**.
+
+### What I measured (my runs, bin size 32, linear SVM on histograms)
+
+Rough data scale:
+
+- **Multiclass:** about **95,856** train / **23,965** test samples, **24** classes, **32** features.  
+- **Binary:** about **107,838** train / **11,983** test (stratified split in the script I used).
+
+| Task | Layer mode | Test accuracy | Notes |
+| --- | --- | --- | --- |
+| Binary | L7 | **~95.65%** | Strong benign vs malware separation. |
+| Binary | AllLayers | **~95.31%** | Similar to L7 for this feature choice. |
+| Multiclass | L7 | **~79.60%** | Harder task; some classes noisier. |
+| Multiclass | AllLayers | **~79.34%** | Same ballpark as L7 here. |
+
+**Binary classification detail (why “~95%” is meaningful, not a fluke)**  
+Example **L7 binary** test report (malware = 0, benign = 1):
+
+| Class | Precision | Recall | F1 | Support (test) |
+| --- | --- | --- | --- | --- |
+| 0 malware | **0.99** | **0.93** | **0.96** | 6312 |
+| 1 benign | **0.92** | **0.99** | **0.96** | 5671 |
+
+So the model is not only accurate overall: **when it flags malware, it is usually right**, and **most benign traffic is found** (high recall on benign). All-layers binary was in the same band (~95%).
+
+**Multiclass caveat**  
+With only **32 histogram features**, some families look similar or have **fewer samples**; you may see **per-class** precision/recall collapse for rare labels. That is a **feature / data** limitation, not a mystery—it motivates richer models (e.g. CNNs on the images) or richer features.
+
+**Experiment tracking**  
+I logged runs with **Weights & Biases** for transparency (dataset size, accuracy, etc.):  
+[https://wandb.ai/ahmadhakimiadnan-other/network-traffic-classification](https://wandb.ai/ahmadhakimiadnan-other/network-traffic-classification)
+
+---
+
+## Reference
+
+- **Paper:** Wei Wang, Ming Zhu, *Malware Traffic Classification Using Convolutional Neural Network for Representation Learning*.  
+- **Course-style repo:** [shivmohith/Network-Traffic-Classification](https://github.com/shivmohith/Network-Traffic-Classification)  
+- **Dataset pointer:** [davidyslu/USTC-TFC2016](https://github.com/davidyslu/USTC-TFC2016)  
+- **Preprocessing tooling (context):** [echowei/DeepTraffic](https://github.com/echowei/DeepTraffic) (USTC-TK2016 / PreprocessedTools path as in original README)
+
+---
+
+*End of Use Case 1 notes. If you extend this work, a natural “Use Case 2” is replacing histogram+SVM with a small CNN on the same PNGs and comparing calibration and per-class confusion matrices.*
