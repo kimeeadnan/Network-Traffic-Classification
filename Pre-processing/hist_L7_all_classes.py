@@ -1,76 +1,64 @@
-import cv2 
-import os 
-import numpy as np 
-from random import shuffle 
-from tqdm import tqdm
+import os
+from random import shuffle
+
+import cv2
 import pandas as pd
-from skimage.feature import hog
-TRAIN_DIR = r"D:\ML mini project\main codes\train_L7"
-training_data = []
-hist = []
-temp = [] #pixels of an image
-temp2 = [] #multiple images(pixel values) in one array
+from tqdm import tqdm
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
-def label(arr):
-    if("BitTorrent" in arr):
-        return 1
-    elif("Facetime" in arr):
-        return 1
-    elif("FTP" in arr):
-        return 1
-    elif("Gmail" in arr):
-        return 1
-    elif("MySQL" in arr):
-        return 1
-    elif("Outlook" in arr):
-        return 1
-    elif("Skype" in arr):
-        return 1
-    elif("SMB" in arr):
-        return 1
-    elif("Weibo" in arr):
-        return 1
-    elif("WorldOfWarcraft" in arr):
-        return 1
-    elif("Cridex" in arr):
-        return 0
-    elif("Geodo" in arr):
-        return 0
-    elif("Htbot" in arr):
-        return 0
-    elif("Miuref" in arr):
-        return 0
-    elif("Neris" in arr):
-        return 0
-    elif("Nsis-ay" in arr):
-        return 0    
-    elif("Shifu" in arr):
-        return 0
-    elif("Tinba" in arr):
-        return 0
-    elif("Virut" in arr):
-        return 0
-    elif("Zeus" in arr):
-        return 0    
+# USTC-TK2016 3_Session2Png.py writes class folders as 0..23 under 4_Png/Train.
+# Override with NTC_TRAIN_DIR / NTC_OUTPUT_CSV when using AllLayers PNGs (same folder layout).
+TRAIN_DIR = os.environ.get(
+    "NTC_TRAIN_DIR",
+    "/home/user/intern-kimu/ntc/uc1/USTC-TK2016/4_Png/Train",
+)
+OUTPUT_CSV = os.environ.get("NTC_OUTPUT_CSV", "dataset_L7_multiclass_bin32.csv")
+LAYER_TAG = os.environ.get("NTC_LAYER", "L7")
 
-for img in tqdm(os.listdir(TRAIN_DIR)):
-        ppc = 8
-        path = os.path.join(TRAIN_DIR, img)
-        t = label(path)
-        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        hist = cv2.calcHist([img],[0],None,[32],[0,256]) #4th parameter can be varied to change the bin size
-        
-        for i in range(len(hist)):
-             temp.append(hist[i][0])
-        temp.append(t)
-        temp2.append(temp)
-        temp = []
-        
-        #np.savetxt("foo.csv", temp,fmt = "%d", delimiter=",")
-#print(temp2)
-        
-shuffle(temp2)
-temp3 = pd.DataFrame(temp2) #converting into dataframe
-print(temp3.shape)
-temp3.to_csv('dataset_L7_hog_binary.csv', index=False)
-            
+run = None
+if wandb is not None:
+    run = wandb.init(
+        project="network-traffic-classification",
+        job_type="preprocess",
+        name=f"{LAYER_TAG.lower()}_histogram_build",
+        config={
+            "train_dir": TRAIN_DIR,
+            "num_bins": 32,
+            "mode": "multiclass",
+            "layer": LAYER_TAG,
+            "output_csv": OUTPUT_CSV,
+        },
+    )
+
+rows = []
+for class_dir in tqdm(sorted(os.listdir(TRAIN_DIR))):
+    class_path = os.path.join(TRAIN_DIR, class_dir)
+    if not os.path.isdir(class_path):
+        continue
+    try:
+        label = int(class_dir)
+    except ValueError:
+        continue
+    for img_name in os.listdir(class_path):
+        img_path = os.path.join(class_path, img_name)
+        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            continue
+        hist = cv2.calcHist([img], [0], None, [32], [0, 256]).flatten()
+        rows.append(list(hist) + [label])
+
+shuffle(rows)
+columns = [f"bin_{i}" for i in range(32)] + ["label"]
+df = pd.DataFrame(rows, columns=columns)
+print(df.shape)
+df.to_csv(OUTPUT_CSV, index=False)
+if run is not None:
+    run.log({
+        "dataset_rows": int(df.shape[0]),
+        "dataset_cols": int(df.shape[1]),
+        "num_classes": int(df["label"].nunique()),
+    })
+    run.finish()

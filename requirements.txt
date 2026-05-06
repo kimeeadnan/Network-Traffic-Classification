@@ -2,4 +2,6 @@ opencv-python
 numpy
 tqdm
 pandas
-skimage
+scikit-image
+scikit-learn
+wandb
